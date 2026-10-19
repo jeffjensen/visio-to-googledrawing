@@ -1,0 +1,4 @@
+# Extra packages for the tests and for the image-comparison scripts in dev\ (compare.py, verify_page.py, baselines.py, ...).
+-r requirements-upload.txt
+numpy==2.5.4
+pillow==13.0.0

@@ -1,0 +1,371 @@
+= visio-to-googledrawing
+:toc: left
+:toclevels: 2
+:sectnums:
+:icons: font
+ifdef::env-github[]
+:note-caption: :information_source:
+endif::[]
+
+Converts the pages of a Visio `.vsdx` file into EMF metafiles and uploads them to Google Drive through the Drive API. Drive turns an EMF into a native Google Drawing when a program uploads it as an import, which is the only route found for getting a Visio diagram into Google Drawings.
+
+NOTE: `vsdx2emf.bat` writes the EMF files. `vsdx2drawing.bat` also uploads each page to Google Drive as a Google Drawing, which needs a one-time Google Cloud setup (see <<google-setup>>).
+
+It runs on Windows only for now. Text layout reads Calibri from `C:\Windows\Fonts`, and the converter stops with a `FileNotFoundError` as soon as it lays out text without those font files (see <<setup>>). A page that uses geometry it does not know is skipped with a message, and pictures, gradients and layers are ignored (see <<converted>>).
+
+== The idea
+
+Drive has no Visio import, and uploading SVG, PDF or PNG does not produce a Drawing. What Drive does convert into a Drawing is a Windows metafile (`application/x-msmetafile`, EMF flavour). So the route is:
+
+----
+.vsdx file --> convert.py --> one .emf per page --> Drive API upload --> Google Drawing
+               (vsdx2emf)                           (vsdx2drawing does both steps)
+----
+
+Visio does not have to be installed. The tool reads the XML inside the `.vsdx` itself.
+
+== Quick start
+
+Do the <<setup>> once, then run this from the repository folder:
+
+[source,powershell]
+----
+.\vsdx2emf.bat "C:\path\to\diagram.vsdx" C:\temp\diagram-emf
+----
+
+That writes one EMF per page into the output folder, named `<file name> - <page name>.emf`:
+
+----
+diagram - Overview.emf
+diagram - Details.emf
+diagram - Notes.emf
+----
+
+Leave out the output folder and the tool creates `<file name>-emf` in the current folder.
+
+To convert and upload in one go, do the <<google-setup>> once and run:
+
+[source,powershell]
+----
+.\vsdx2drawing.bat "C:\path\to\diagram.vsdx"
+----
+
+That uploads each page to the top of your My Drive as a Google Drawing named `<file name> - <page name>`. Add `--dry-run` to see what would be uploaded without signing in.
+
+[[setup]]
+== Setup
+
+Tested with Python 3.14.8 on Windows 11. Create the environment once, in the repository folder (the launcher expects it at `.venv`):
+
+[source,powershell]
+----
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+----
+
+* `requirements.txt` lists the two runtime packages, fonttools and uharfbuzz.
+* `requirements-upload.txt` adds the Google packages that `vsdx2drawing.bat` needs: `.venv\Scripts\python.exe -m pip install -r requirements-upload.txt`.
+* `requirements-dev.txt` adds numpy and Pillow for the image-comparison scripts in `dev\`, and includes `requirements-upload.txt` for the tests.
+* Text layout reads Calibri from `C:\Windows\Fonts` (`calibri.ttf`, `calibrib.ttf`, `calibrii.ttf`, `calibriz.ttf`); the folder is the `FONT_DIR` constant in `vsdxconv\text.py`. Calibri is Microsoft's and is not included here. Roboto is bundled in `fonts\`.
+
+== Usage
+
+[source,powershell]
+----
+vsdx2emf.bat <file.vsdx | unzipped-dir> [<out-dir>] [options]
+.venv\Scripts\python.exe -I convert.py <file.vsdx | unzipped-dir> [<out-dir>] [options]
+----
+
+The batch file runs the second form with the Python in `.venv`. The `-I` (isolated mode) keeps the current folder and environment variables from changing which modules get imported; leave it in when converting files you did not make yourself.
+
+The first argument is a `.vsdx` file, which is unzipped to a temporary folder for the run, or a folder that already holds an unzipped package (`extract_vsdx.py` makes one).
+
+[cols="2,5",options="header"]
+|===
+|Option |Meaning
+
+|`--page NAME`
+|Convert only this page. Repeat for several. Names must match exactly, for example `--page "Overview, Part 1"`.
+
+|`--prefix P`
+|Name the files `P - page.emf`. Default: the `.vsdx` file's name, or no prefix when the input is a folder.
+
+|`--crop MARGIN`
+|Crop to the drawing's content plus this margin, in paper inches. Google fits the picture into a fixed canvas (see <<upload>>), so cropping empty page area makes the drawing larger on it.
+
+|`--text-mode importer` or `outline`
+|`importer` (default) writes text as EMF text records in the font Roboto, sized so that Google's importer renders them as tall and as wide as the original Calibri text. `outline` writes the text as filled Calibri glyph outlines instead.
+
+|`--upi N`
+|Output units per paper inch. 0 (default) picks the largest value up to 3000 at which every coordinate still fits in 16 bits, which keeps the EMF small.
+
+|`--svg DPI`
+|Also write an SVG preview of each page next to its EMF, at this many pixels per inch.
+
+|`--uniq`
+|Make near-identical records distinct (padded record bounds, rotated start vertex). Only needed when the EMF has to be copied by hand as base64; see <<upload>>.
+|===
+
+Exit status is 0 when every requested page was written. It is 1 for unusable input, an unknown page name, or a page skipped because it uses a Visio feature that is not supported yet, and 2 for a bad command line. A skipped page is reported on stderr and the other pages are still written.
+
+=== Check a new kind of drawing first
+
+A drawing may use a Visio feature the converter does not know. To see what a file uses before converting it:
+
+[source,powershell]
+----
+.venv\Scripts\python.exe -I extract_vsdx.py "C:\path\to\my.vsdx" C:\temp\my-unzipped
+.venv\Scripts\python.exe -I dev\survey_vsdx.py C:\temp\my-unzipped
+----
+
+The survey lists, per page, the shape types, masters, geometry row types, sections and notable cells.
+
+[[upload]]
+== Getting the EMFs into Google Drive
+
+=== What Drive does to the file
+
+* Putting an EMF or WMF in a Drive for desktop folder does not convert it: the sync client uploads a plain file (tested with both). Conversion happens only when a program uploads it as an import.
+* Only a metafile becomes a Drawing, and only when the upload is declared as `application/x-msmetafile`, for WMF and EMF alike. The same bytes declared as `image/emf` are stored as a plain file.
+* Text always becomes vector outlines in Roboto, whatever font the EMF names. It is not editable as text afterwards.
+* The Drawing canvas is a fixed 800 x 600 landscape. The picture is scaled to fit within 11/12 of the canvas and centred (as `vsdxconv\svgprev.py` models it), so portrait pages come out small. `--crop` helps.
+
+=== With the Drive API (vsdx2drawing)
+
+`vsdx2drawing.bat` converts a `.vsdx` and uploads every page as a Google Drawing, or uploads EMF and WMF files you already have. It talks to the Drive API under your own Google sign-in, so no file passes through a model and nothing is copied by hand.
+
+[[google-setup]]
+==== One-time Google setup
+
+The script needs an OAuth client of type Desktop app from a Google Cloud project of your own:
+
+. In the https://console.cloud.google.com/[Google Cloud console] create a project, or pick one, and enable the *Google Drive API* for it.
+. Open *Google Auth platform*. Under *Branding*, name the app and give your email address. Under *Audience*, choose *External* and add the Google account whose Drive you will upload to as a *Test user*. Under *Data Access*, add the scope `https://www.googleapis.com/auth/drive.file`, and `https://www.googleapis.com/auth/drive` as well if you will use `--full-drive`.
+. Under *Clients*, choose *Create client*, set *Application type* to *Desktop app*, create it, and download the JSON.
+. Save the JSON as `%APPDATA%\visio-to-googledrawing\client_secret.json`, or pass its path with `--client-secret`.
+. Run `vsdx2drawing.bat --check`. Your browser opens for Google's sign-in and consent. Google may warn that the app is unverified, which is expected for your own client. The script then prints the account, the access granted, and whether Drive offers to convert a metafile upload to a Drawing.
+
+The client secret and the saved sign-in stay in `%APPDATA%\visio-to-googledrawing\` (set `VSDX_GDRIVE_DIR` to use another folder), never in the repository.
+
+==== Running the upload
+
+[source,powershell]
+----
+vsdx2drawing.bat <file.vsdx | file.emf | file.wmf | folder> ... [options]
+vsdx2drawing.bat --check
+----
+
+A `.vsdx` is converted first, with the converter options described under Usage above. An `.emf` or `.wmf` file, or a folder of them, is uploaded as it is, and the file name becomes the Drawing's name.
+
+[cols="2,5",options="header"]
+|===
+|Option |Meaning
+
+|`--folder ID_OR_URL`
+|Put the Drawings in this Drive folder, given as a folder id or the link from your browser. Default: the top of My Drive. A folder you made yourself needs `--full-drive`.
+
+|`--full-drive`
+|Ask Google for access to all of your Drive instead of only the files this script creates (see below). Each kind of access is signed in and saved separately.
+
+|`--allow-duplicates`
+|Upload even when a Drawing with that name is already in the folder.
+
+|`--dry-run`
+|Convert and list what would be uploaded. No sign-in, nothing uploaded.
+
+|`--emf-dir DIR`
+|Keep the converted EMFs in `DIR`, one subfolder per `.vsdx`. Default: a temporary folder.
+
+|`--check`
+|Sign in, then report the account, the access granted, whether Drive converts metafile uploads and, with `--folder`, whether that folder is usable.
+
+|`--auth`
+|Ignore the saved sign-in and sign in again.
+
+|`--client-secret FILE`
+|Use this client secret instead of the one in `%APPDATA%\visio-to-googledrawing`.
+
+|`--no-browser`
+|Print the sign-in link instead of opening a browser.
+
+|`--page`, `--prefix`, `--crop`, `--text-mode`, `--upi`
+|Passed to the converter for `.vsdx` inputs; see the options above.
+|===
+
+A Drawing is named `<file name> - <page name>`, or just `<file name>` for a one-page `.vsdx` converted whole. A Drawing with that name already in the target folder is reported as `exists` and skipped, so running the same command twice does not pile up copies.
+
+Exit status is 0 when every file was uploaded or already there, 1 when the converter skipped a page, an upload failed or there was nothing to upload, and 2 for a bad command line or missing Google setup.
+
+Good to know:
+
+* *Access.* By default the script asks only for the `drive.file` scope: it can see and change just the files it created itself, which is enough to upload into My Drive. Drive does not let it use a folder it did not create, so `--folder` with a folder you made by hand usually fails with "cannot find folder"; add `--full-drive` for that. The duplicate check has the same limit: under the default access it cannot see Drawings made by anything else, such as the Claude connector.
+* *Weekly sign-in.* While the consent screen's publishing status is Testing, Google expires the saved sign-in after 7 days (https://developers.google.com/identity/protocols/oauth2#expiration[Google's rule]). The script notices and opens the browser again.
+* *A conversion that does not happen.* If Drive stores an upload as a plain file instead of converting it, the script moves that file to the trash, stops, and says so. `--check` shows beforehand whether Drive lists metafile import.
+* *Size.* A file over 5 MB is refused, which is Drive's limit for a simple upload. Page EMFs are far smaller.
+
+=== With Claude Code and the Google Drive connector
+
+This route needs no Google Cloud setup, but every EMF passes through the model as base64 text. In a Claude Code session with the Google Drive connector enabled, ask for a file by name and Claude can follow these steps:
+
+. Convert the file: `vsdx2emf.bat file.vsdx out-dir`.
+. For each EMF, call the connector's `create_file` with `contentMimeType: application/x-msmetafile`, a `title`, and `base64Content` holding the EMF's base64 on one unbroken line. `dev\b64line.py` prints exactly that line.
+. `create_file` ignores `parentId` and puts the new Drawing in My Drive. Move it with `update_file` and the target folder's id.
+. Pages that are byte-identical across files only need uploading once; use `copy_file` for the rest.
+. Check each upload: export it as `image/svg+xml` and overlay the result on the expected rendering with `dev\verify_page.py`.
+
+The weak point is the base64. It has to pass through the model as text, and one dropped character corrupts everything after it (the symptom is "Internal error encountered"). Pages with rows of identical shapes, such as the rungs of a ladder, are the likely victims, which is what `--uniq` is for. Compare what was sent with the intended file using `dev\sent_vs_orig.py`.
+
+[[converted]]
+== What is converted
+
+[cols="2,5",options="header"]
+|===
+|Visio feature |Handling
+
+|Shapes, groups, masters
+|Supported. Cell values resolve shape, then master shape, then style-sheet chain, then default. The values Visio cached in the file are used; formulas are never evaluated. Themes are not read: a cell set to "Themed" falls back to the "No Style" defaults.
+
+|Geometry
+|`MoveTo`, `LineTo`, `RelMoveTo`, `RelLineTo`, `EllipticalArcTo`, `Ellipse`, `CubBezTo`, `RelCubBezTo` (arcs and ellipses become cubic Beziers). `NoFill`, `NoLine` and `NoShow` are honoured. Any other row type, for example `ArcTo`, `PolylineTo`, `NURBSTo`, `SplineStart`, `InfiniteLine` or `RelQuadBezTo`, stops that page with a message.
+
+|Position
+|Pin and local pin, angle, horizontal and vertical flips, page and drawing scale. Guide shapes are skipped.
+
+|Lines
+|Colour and weight. Pattern 0 is no line; patterns 2 to 5 become dash, dot, dash-dot and dash-dot-dot; any other non-solid pattern is drawn dashed. Line caps, joins and rounded corners are ignored.
+
+|Fills
+|None or solid foreground colour. Every non-zero fill pattern is drawn solid: no hatches, gradients, transparency or shadows.
+
+|Arrowheads
+|Any begin or end arrow other than 0 becomes a filled triangle at the end of an open path, sized by the arrow-size cell.
+
+|Text
+|Paragraphs, word wrap, horizontal and vertical alignment, margins, line spacing, text block position and rotation, size, bold, italic, underline, colour, all caps, font scale, letter spacing and a text background box. Layout always uses Calibri metrics, whatever font Visio names. Tab stops, bullets and superscript or subscript are not handled.
+
+|Not handled
+|Embedded pictures and OLE objects (the image data is never read), layers (visibility is ignored), hyperlinks, shape data. Background pages are converted as pages of their own, not drawn under the pages that use them.
+|===
+
+The input must be a `.vsdx` package (a zip file). The old binary `.vsd` format is not supported and is rejected with a message.
+
+When a page is skipped, the message names the Visio feature, for example:
+
+----
+skipped 'Page-1': not supported yet: geometry row type 'NURBSTo' (shape 12)
+----
+
+To add support, add a branch for that row type to `geometry()` in `vsdxconv\geom.py`. It builds `Subpath` objects out of straight segments `("L", point)` and cubic segments `("C", control1, control2, point)`.
+
+== How it works
+
+[cols="2,5",options="header"]
+|===
+|File |Role
+
+|`vsdxconv\model.py`
+|Loads the unzipped package: document styles and colours, masters, pages and shapes with inheritance.
+
+|`vsdxconv\geom.py`
+|Shape transforms, and Geometry sections turned into subpaths of lines and cubic Beziers.
+
+|`vsdxconv\render.py`
+|Walks a page's shapes (groups recursively) into a flat list of drawing operations in output units: filled and stroked paths, arrowheads and text. Also does the crop.
+
+|`vsdxconv\text.py`
+|Text: runs and paragraphs from the shape's `Text` element, HarfBuzz shaping with Calibri, word wrap and alignment, and the Roboto size and width parameters used for text records.
+
+|`vsdxconv\emit.py` and `emf.py`
+|Operations to EMF bytes. Straight shapes become polygon and polyline records; anything with curves uses path brackets so the Beziers survive Google's importer. Point records use the 16-bit form when every point fits.
+
+|`vsdxconv\svgprev.py`
+|Operations to SVG, for `--svg` previews. Text is drawn as Roboto outlines placed the way the importer places them.
+
+|`convert.py`, `extract_vsdx.py`
+|Command-line entry point, and the unzip step (it refuses a non-empty target and any archive member whose path would land outside it).
+
+|`vsdx2drawing.py`
+|Command-line entry point for the upload: runs `convert.py` on each `.vsdx`, signs in, and uploads every page.
+
+|`gdrive.py`
+|Google sign-in (OAuth for a Desktop app, with PKCE) and the Drive calls: the multipart upload as an import, the duplicate check, the folder lookup, and trashing a file that failed to convert.
+|===
+
+Output is deterministic: the same file gives byte-identical EMFs, including with `--uniq`, which uses a fixed random seed. The EMF writer keeps files compact and avoids long runs of zero bytes.
+
+== Folder layout
+
+----
+visio-to-googledrawings
+  README.adoc
+  LICENSE                Apache License 2.0, for the code (the fonts carry their own copy)
+  .gitignore
+  vsdx2emf.bat           launcher: runs convert.py with the Python in .venv
+  convert.py             command-line entry point
+  vsdx2drawing.bat       launcher: runs vsdx2drawing.py with the Python in .venv
+  vsdx2drawing.py        convert a .vsdx and upload each page to Google Drive as a Drawing
+  gdrive.py              Google sign-in and the Drive API calls
+  extract_vsdx.py        unzip a .vsdx (convert.py uses it too)
+  emf.py                 minimal EMF writer
+  vsdxconv\              the converter package
+  fonts\                 Roboto Regular, Bold, Italic, BoldItalic, and the Apache 2.0 LICENSE
+  dev\                   probe, calibration and verification scripts
+  tests\                 offline tests of the upload code
+  requirements.txt       runtime packages
+  requirements-upload.txt  adds the Google packages for the upload
+  requirements-dev.txt   adds numpy and Pillow, and the upload packages, for dev and the tests
+  .venv\                 your Python environment, made by Setup (not in the repository)
+----
+
+== Development scripts
+
+`dev\` holds what the converter was built and calibrated with. None of it is needed to convert a file. Run them like the converter, for example `.venv\Scripts\python.exe -I dev\survey_vsdx.py <unzipped-dir>`; each script's docstring has its usage.
+
+[cols="2,5",options="header"]
+|===
+|Script |Purpose
+
+|`survey_vsdx.py`, `survey2.py`, `dump_vsdx.py`, `dump_ops.py`
+|Inspect an unzipped `.vsdx`: features per page, the distinct values of rendering-related cells, raw shapes and masters, and the drawing operations that fall in a box.
+
+|`emf_walk.py`, `b64show.py`, `b64line.py`
+|Look inside an EMF (record list, text records) and print its base64, wrapped or on one line.
+
+|`make_emf_probe.py`, `make_emf_probe3.py`, `make_font_probe.py`, `make_style_probe.py`, `make_small_probe.py`
+|Generate small test EMFs to find out how Google's importer behaves: whether tiny metafiles convert, frame versus bounds sizing, holes, which face names map to which fonts, bold, italic, underline and width handling, small text records.
+
+|`make_dx_probe.py`, `make_font_probe.py` with the `dx` argument
+|Stale: they pass a `dx` argument to `Emf.text()`, which `emf.py` no longer accepts, so they fail.
+
+|`make_probe_wmf.py`, `make_text_probe.py`, `wmf.py`
+|The same kind of experiment with the older WMF format. The converter uses EMF.
+
+|`calib_text.py`
+|Writes a calibration EMF of text lines at the real operating scale, to measure the importer's text widths.
+
+|`verify_page.py`, `svg_paths.py`, `decode_export.py`
+|Check an uploaded Drawing: decode a saved Drive export, parse its SVG, and overlay it on the expected rendering.
+
+|`compare.py`, `baselines.py`, `crop_pair.py`, `region_shift.py`
+|Measure differences between a rendering and a Visio PNG export: best-fit shift, text baselines, region shifts, zoomed side-by-side crops. These need numpy and Pillow.
+
+|`sent_vs_orig.py`
+|Compare the base64 actually sent in `create_file` calls, read from a Claude Code session transcript, with the intended EMF.
+|===
+
+== Tests
+
+The upload code has offline tests. They use a fake Drive that converts an upload only the way the real service does (the Drawing type in the metadata and `application/x-msmetafile` on the media part), and a local web server to check the bytes that go over the wire. They need `requirements-upload.txt`.
+
+[source,powershell]
+----
+.venv\Scripts\python.exe -I -B -m unittest discover -s tests -v
+----
+
+== Fonts
+
+Roboto v2.138 from the googlefonts/roboto release `roboto-unhinted.zip`, Apache License 2.0 (`fonts\LICENSE`). Google's importer draws all metafile text in Roboto, so the converter measures with it.
+
+== License
+
+Apache License 2.0; see `LICENSE`. The bundled Roboto fonts are also under Apache 2.0 (`fonts\LICENSE`).

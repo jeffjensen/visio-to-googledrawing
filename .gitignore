@@ -1,0 +1,15 @@
+# Python environment and bytecode
+.venv/
+__pycache__/
+*.pyc
+
+# Default output folder of convert.py (<name>-emf)
+*-emf/
+
+# Google sign-in material. It normally lives in %APPDATA%\visio-to-googledrawing, outside the repository.
+client_secret*.json
+token*.json
+
+# Visio drawings are input, not part of the tool. To keep a deliberate sample, use "git add -f".
+*.vsdx
+*.vsd
